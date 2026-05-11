@@ -13,7 +13,7 @@ STANDARDIZED NAMING CONVENTION:
   * PROCESS_* for media processing triggers
   * SKIP_* for all skip conditions
   * SUBTITLE_* for subtitle-related settings
-  * WHISPER_* for Whisper model settings
+  * OPENAI_* for OpenAI-compatible transcription endpoint settings
   * TRANSCRIBE_* for transcription settings
 
 BACKWARDS COMPATIBILITY: 
@@ -42,36 +42,32 @@ Users can gradually migrate to the new names. Both will work simultaneously duri
 transition period. The old names may be deprecated in future versions. 
 """
 
-import ast
 import asyncio
-import ctypes
-import ctypes.util
-import gc
 import hashlib
+import io
 import json
 import logging
+import mimetypes
 import os
 import queue
+import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import wave
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from datetime import datetime
-from threading import Event, Lock, Timer
+from threading import Event, Lock
 from typing import List, Union
 
 import av
-import faster_whisper
 import ffmpeg
-import numpy as np
 import requests
-import stable_whisper
-import torch
 from fastapi import Body, FastAPI, File, Form, Header, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from stable_whisper import Segment
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver as Observer
 
@@ -113,11 +109,32 @@ plexserver = get_env_with_fallback('PLEX_SERVER', 'PLEXSERVER', 'http://192.168.
 jellyfintoken = get_env_with_fallback('JELLYFIN_TOKEN', 'JELLYFINTOKEN', 'token here')
 jellyfinserver = get_env_with_fallback('JELLYFIN_SERVER', 'JELLYFINSERVER', 'http://192.168.1.111:8096')
 
-# Whisper Configuration
-whisper_model = os.getenv('WHISPER_MODEL', 'medium')
-whisper_threads = int(os.getenv('WHISPER_THREADS', 4))
+# OpenAI-compatible transcription endpoint configuration
+openai_base_url = os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
+openai_transcriptions_url = os.getenv('OPENAI_TRANSCRIPTIONS_URL', '')
+openai_translations_url = os.getenv('OPENAI_TRANSLATIONS_URL', '')
+openai_api_key = os.getenv('OPENAI_API_KEY', '')
+openai_organization = os.getenv('OPENAI_ORGANIZATION', '')
+openai_project = os.getenv('OPENAI_PROJECT', '')
+transcription_model = os.getenv('OPENAI_TRANSCRIPTION_MODEL', os.getenv('TRANSCRIPTION_MODEL', 'whisper-1'))
+translation_model = os.getenv('OPENAI_TRANSLATION_MODEL', 'whisper-1')
+openai_api_timeout = int(os.getenv('OPENAI_API_TIMEOUT', os.getenv('ASR_TIMEOUT', 18000)))
+openai_audio_format = os.getenv('OPENAI_AUDIO_FORMAT', 'wav').lower().lstrip('.')
+openai_audio_bitrate = os.getenv('OPENAI_AUDIO_BITRATE', '64k')
+openai_temperature = os.getenv('OPENAI_TEMPERATURE', '')
+min_remote_audio_seconds = float(os.getenv('MIN_REMOTE_AUDIO_SECONDS', '0.1'))
+audio_debug = convert_to_bool(os.getenv('AUDIO_DEBUG', False))
+audio_debug_save = convert_to_bool(os.getenv('AUDIO_DEBUG_SAVE', False))
+audio_debug_dir = os.getenv('AUDIO_DEBUG_DIR', '/tmp/subgen-audio-debug')
+try:
+    openai_extra_params = json.loads(os.getenv('OPENAI_EXTRA_PARAMS', '{}') or '{}')
+    if not isinstance(openai_extra_params, dict):
+        raise ValueError("OPENAI_EXTRA_PARAMS must be a JSON object")
+except ValueError:
+    openai_extra_params = {}
+    logging.info("OPENAI_EXTRA_PARAMS is invalid, defaulting to empty '{}'")
+
 concurrent_transcriptions = int(os.getenv('CONCURRENT_TRANSCRIPTIONS', 2))
-transcribe_device = os.getenv('TRANSCRIBE_DEVICE', 'cpu')
 
 # Processing Control - with backwards compatibility
 procaddedmedia = get_env_with_fallback('PROCESS_ADDED_MEDIA', 'PROCADDEDMEDIA', True, convert_to_bool)
@@ -128,25 +145,19 @@ subtitle_language_name = get_env_with_fallback('SUBTITLE_LANGUAGE_NAME', 'NAMESU
 
 # System Configuration - with backwards compatibility
 webhookport = get_env_with_fallback('WEBHOOK_PORT', 'WEBHOOKPORT', 9000, int)
-word_level_highlight = convert_to_bool(os.getenv('WORD_LEVEL_HIGHLIGHT', False))
 debug = convert_to_bool(os.getenv('DEBUG', True))
 use_path_mapping = convert_to_bool(os.getenv('USE_PATH_MAPPING', False))
 path_mapping_from = os.getenv('PATH_MAPPING_FROM', r'/tv')
 path_mapping_to = os.getenv('PATH_MAPPING_TO', r'/Volumes/TV')
-model_location = os.getenv('MODEL_PATH', './models')
 monitor = convert_to_bool(os.getenv('MONITOR', False))
 transcribe_folders = os.getenv('TRANSCRIBE_FOLDERS', '')
 transcribe_or_translate = os.getenv('TRANSCRIBE_OR_TRANSLATE', 'transcribe').lower()
-clear_vram_on_complete = convert_to_bool(os.getenv('CLEAR_VRAM_ON_COMPLETE', True))
-compute_type = os.getenv('COMPUTE_TYPE', 'auto')
 append = convert_to_bool(os.getenv('APPEND', False))
 reload_script_on_change = convert_to_bool(os.getenv('RELOAD_SCRIPT_ON_CHANGE', False))
 lrc_for_audio_files = convert_to_bool(os.getenv('LRC_FOR_AUDIO_FILES', True))
-custom_regroup = os.getenv('CUSTOM_REGROUP', 'cm_sl=84_sl=42++++++1')
 detect_language_length = int(os.getenv('DETECT_LANGUAGE_LENGTH', 30))
 detect_language_offset = int(os.getenv('DETECT_LANGUAGE_OFFSET', 0))
-model_cleanup_delay = int(os.getenv('MODEL_CLEANUP_DELAY', 30))
-asr_timeout = int(os.getenv('ASR_TIMEOUT', 18000))
+asr_timeout = openai_api_timeout
 webhook_url_completed = os.getenv('WEBHOOK_URL_COMPLETED', '')
 
 # Skip Configuration - with backwards compatibility
@@ -177,19 +188,9 @@ subtitle_language_naming_type = os.getenv('SUBTITLE_LANGUAGE_NAMING_TYPE', 'ISO_
 only_match_subgen_subtitles = get_env_with_fallback('SKIP_ONLY_SUBGEN_SUBTITLES', 'ONLY_SKIP_IF_SUBGEN_SUBTITLE', False, convert_to_bool)
 skip_unknown_language = convert_to_bool(os.getenv('SKIP_UNKNOWN_LANGUAGE', False))
 skip_if_no_audio_language_but_subtitles_exist = get_env_with_fallback('SKIP_IF_NO_LANGUAGE_BUT_SUBTITLES_EXIST', 'SKIP_IF_LANGUAGE_IS_NOT_SET_BUT_SUBTITLES_EXIST', False, convert_to_bool)
-should_whisper_detect_audio_language = convert_to_bool(os.getenv('SHOULD_WHISPER_DETECT_AUDIO_LANGUAGE', False))
+should_whisper_detect_audio_language = get_env_with_fallback('SHOULD_DETECT_AUDIO_LANGUAGE', 'SHOULD_WHISPER_DETECT_AUDIO_LANGUAGE', False, convert_to_bool)
 show_in_subname_subgen = convert_to_bool(os.getenv('SHOW_IN_SUBNAME_SUBGEN', True))
 show_in_subname_model = convert_to_bool(os.getenv('SHOW_IN_SUBNAME_MODEL', True))
-
-# Advanced Configuration
-try:
-    kwargs = ast.literal_eval(os.getenv('SUBGEN_KWARGS', '{}') or '{}')
-except ValueError:
-    kwargs = {}
-    logging.info("kwargs (SUBGEN_KWARGS) is an invalid dictionary, defaulting to empty '{}'")
-    
-if transcribe_device == "gpu":
-    transcribe_device = "cuda"
 
 VIDEO_EXTENSIONS = (
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".mpg", ".mpeg", 
@@ -210,15 +211,6 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
-
-model = None
-model_cleanup_timer = None
-model_cleanup_lock = Lock()
-
-# Locks to ensure thread-safety during concurrent AI operations
-model_load_lock = Lock()
-active_direct_tasks = 0
-active_direct_tasks_lock = Lock()
 
 in_docker = os.path.exists('/.dockerenv')
 docker_status = "Docker" if in_docker else "Standalone"
@@ -410,8 +402,6 @@ def transcription_worker():
                         logging.debug(f"Queued transcription for detected language: {next_task['path']}")
                     else:
                         logging.debug(f"Transcription already queued/processing for: {next_task['path']}")
-                        
-                delete_model()
 
 # Create worker threads
 for _ in range(concurrent_transcriptions):
@@ -466,67 +456,744 @@ logging.getLogger("watchfiles").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 
-class ProgressHandler:
-    def __init__(self, filename):
-        self.filename = filename
-        self.start_time = time.time()
-        self.last_print_time = 0
-        self.interval = 5
-
-    @staticmethod
-    def _fmt_t(seconds):
-        """Format seconds as [H:]MM:SS without milliseconds."""
-        m, s = divmod(int(seconds), 60)
-        h, m = divmod(m, 60)
-        if h > 0:
-            return f"{h}:{m:02d}:{s:02d}"
-        return f"{m:02d}:{s:02d}"
-
-    def __call__(self, seek, total):
-        if docker_status == 'Docker' or debug:
-            current_time = time.time()
-            if self.last_print_time == 0 or (current_time - self.last_print_time) >= self.interval:
-                self.last_print_time = current_time
-
-                pct = int((seek / total) * 100) if total > 0 else 0
-                elapsed = current_time - self.start_time
-                speed = seek / elapsed if elapsed > 0 else 0
-                eta = (total - seek) / speed if speed > 0 else 0
-
-                proc = len(task_queue.get_processing_tasks())
-                queued = len(task_queue.get_queued_tasks())
-
-                clean_name = (self.filename[:37] + '..') if len(self.filename) > 40 else self.filename
-
-                logging.info(
-                    f"[ {clean_name:<40}] {pct:>3}% | "
-                    f"{int(seek):>5}/{int(total):<5}s "
-                    f"[{self._fmt_t(elapsed):>5}<{self._fmt_t(eta):>5}, {speed:>5.2f}s/s] | "
-                    f"Jobs: {proc} processing, {queued} queued"
-                )
-                
 TIME_OFFSET = 5
+RAW_PCM_UPLOAD_SAMPLE_RATE = 16000
+RAW_PCM_UPLOAD_CHANNELS = 1
+RAW_PCM_UPLOAD_SAMPLE_WIDTH = 2
+RAW_PCM_UPLOAD_BYTES_PER_SECOND = (
+    RAW_PCM_UPLOAD_SAMPLE_RATE * RAW_PCM_UPLOAD_CHANNELS * RAW_PCM_UPLOAD_SAMPLE_WIDTH
+)
 
-def appendLine(result):
-    if append:
-        lastSegment = result.segments[-1]
-        date_time_str = datetime.now().strftime("%d %b %Y - %H:%M:%S")
-        appended_text = f"Transcribed by whisperAI with faster-whisper ({whisper_model}) on {date_time_str}"
-        
-        # Create a new segment with the updated information
-        newSegment = Segment(
-            start=lastSegment.start + TIME_OFFSET,
-            end=lastSegment.end + TIME_OFFSET,
-            text=appended_text,
-            words=[], # Empty list for words
-            id=lastSegment.id + 1
+SRT_TIME_RE = re.compile(
+    r"(?P<start>\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2}[,.]\d{3})"
+)
+
+
+def seconds_to_srt_time(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    millis = int(round((seconds - int(seconds)) * 1000))
+    total_seconds = int(seconds)
+    if millis == 1000:
+        total_seconds += 1
+        millis = 0
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def srt_time_to_seconds(value: str) -> float:
+    time_part, millis = value.replace('.', ',').split(',')
+    hours, minutes, seconds = [int(part) for part in time_part.split(':')]
+    return hours * 3600 + minutes * 60 + seconds + int(millis) / 1000
+
+
+def shift_srt_timestamps(srt_text: str, offset: float) -> str:
+    if offset <= 0:
+        return srt_text
+
+    def replace(match):
+        start = seconds_to_srt_time(srt_time_to_seconds(match.group("start")) + offset)
+        end = seconds_to_srt_time(srt_time_to_seconds(match.group("end")) + offset)
+        return f"{start} --> {end}"
+
+    shifted = SRT_TIME_RE.sub(replace, srt_text)
+    logging.info(f"Applied +{offset:.3f}s timestamp offset")
+    return shifted
+
+
+def append_srt_watermark(srt_text: str) -> str:
+    if not append or not srt_text.strip():
+        return srt_text
+
+    matches = list(SRT_TIME_RE.finditer(srt_text))
+    last_end = srt_time_to_seconds(matches[-1].group("end")) if matches else 0.0
+    start = last_end + TIME_OFFSET
+    end = start + 4
+    blocks = [block for block in re.split(r"\n\s*\n", srt_text.strip()) if block.strip()]
+    next_index = len(blocks) + 1
+    date_time_str = datetime.now().strftime("%d %b %Y - %H:%M:%S")
+    appended_text = f"Transcribed by Subgen using {transcription_model} on {date_time_str}"
+    block = f"{next_index}\n{seconds_to_srt_time(start)} --> {seconds_to_srt_time(end)}\n{appended_text}"
+    return f"{srt_text.rstrip()}\n\n{block}\n"
+
+
+def openai_audio_url(task: str) -> str:
+    if task == "translate" and openai_translations_url:
+        return openai_translations_url
+    if task != "translate" and openai_transcriptions_url:
+        return openai_transcriptions_url
+
+    base = openai_base_url.rstrip("/")
+    if base.endswith("/audio/transcriptions") or base.endswith("/audio/translations"):
+        return re.sub(r"/audio/(transcriptions|translations)$", f"/audio/{'translations' if task == 'translate' else 'transcriptions'}", base)
+    return f"{base}/audio/{'translations' if task == 'translate' else 'transcriptions'}"
+
+
+def openai_headers() -> dict:
+    headers = {}
+    if openai_api_key:
+        headers["Authorization"] = f"Bearer {openai_api_key}"
+    if openai_organization:
+        headers["OpenAI-Organization"] = openai_organization
+    if openai_project:
+        headers["OpenAI-Project"] = openai_project
+    return headers
+
+
+def guess_mime_type(filename: str) -> str:
+    mime_type, _ = mimetypes.guess_type(filename)
+    return mime_type or "application/octet-stream"
+
+
+def remote_audio_request(
+    audio_content: bytes,
+    filename: str,
+    task: str = "transcribe",
+    language: str | None = None,
+    prompt: str | None = None,
+    response_format: str = "srt",
+):
+    model_name = translation_model if task == "translate" else transcription_model
+    data = {
+        "model": model_name,
+        "response_format": response_format,
+    }
+    if task != "translate" and language:
+        data["language"] = language
+    if prompt:
+        data["prompt"] = prompt
+    if openai_temperature != "":
+        data["temperature"] = openai_temperature
+    data.update(openai_extra_params)
+
+    files = {
+        "file": (filename, audio_content, guess_mime_type(filename)),
+    }
+    url = openai_audio_url(task)
+
+    logging.info(f"Sending {task} request to {url} with model {model_name}")
+    log_audio_debug(
+        f"AUDIO DEBUG posting request task={task} filename={filename} content_type={guess_mime_type(filename)} "
+        f"bytes={len(audio_content)} response_format={response_format} language={language}"
+    )
+    response = requests.post(
+        url,
+        headers=openai_headers(),
+        data=data,
+        files=files,
+        timeout=openai_api_timeout,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Transcription endpoint returned HTTP {response.status_code}: {response.text[:1000]}")
+
+    content_type = response.headers.get("content-type", "")
+    if response_format in {"json", "verbose_json"} or "application/json" in content_type:
+        return response.json()
+    return response.text
+
+
+def response_text(response) -> str:
+    if isinstance(response, dict):
+        return response.get("text", json.dumps(response))
+    return str(response)
+
+
+def response_language(response, fallback: LanguageCode = LanguageCode.NONE, task: str = "transcribe") -> LanguageCode:
+    if task == "translate":
+        return LanguageCode.ENGLISH
+    if isinstance(response, dict):
+        detected = LanguageCode.from_string(response.get("language"))
+        if detected:
+            return detected
+    return fallback or LanguageCode.NONE
+
+
+def segments_to_srt(segments: list) -> str:
+    lines = []
+    for index, segment in enumerate(segments, start=1):
+        start = segment.get("start", 0)
+        end = segment.get("end", start + 5)
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        lines.append(f"{index}\n{seconds_to_srt_time(start)} --> {seconds_to_srt_time(end)}\n{text}")
+    return "\n\n".join(lines) + ("\n" if lines else "")
+
+
+def segments_to_lrc(segments: list) -> str:
+    lines = []
+    for segment in segments:
+        text = str(segment.get("text", "")).strip().replace("\n", " ")
+        if not text:
+            continue
+        start = float(segment.get("start", 0))
+        minutes, seconds = divmod(int(start), 60)
+        fraction = int((start - int(start)) * 100)
+        lines.append(f"[{minutes:02d}:{seconds:02d}.{fraction:02d}]{text}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def segments_to_tsv(segments: list) -> str:
+    lines = ["start\tend\ttext"]
+    for segment in segments:
+        text = str(segment.get("text", "")).strip().replace("\t", " ").replace("\n", " ")
+        lines.append(f"{int(float(segment.get('start', 0)) * 1000)}\t{int(float(segment.get('end', 0)) * 1000)}\t{text}")
+    return "\n".join(lines) + "\n"
+
+
+def response_to_srt(response) -> str:
+    if isinstance(response, dict):
+        if isinstance(response.get("segments"), list):
+            return segments_to_srt(response["segments"])
+        return f"1\n00:00:00,000 --> 00:00:05,000\n{response.get('text', '').strip()}\n"
+    return str(response)
+
+
+def response_to_lrc(response) -> str:
+    if isinstance(response, dict) and isinstance(response.get("segments"), list):
+        return segments_to_lrc(response["segments"])
+    text = response_text(response).strip()
+    return f"[00:00.00]{text}\n" if text else ""
+
+
+def output_from_response(response, output: str) -> str:
+    if output == "json":
+        return json.dumps(response, ensure_ascii=False)
+    if output == "tsv":
+        if isinstance(response, dict) and isinstance(response.get("segments"), list):
+            return segments_to_tsv(response["segments"])
+        return f"start\tend\ttext\n0\t0\t{response_text(response).strip()}\n"
+    if output == "srt":
+        return response_to_srt(response)
+    return response_text(response)
+
+
+def log_audio_debug(message: str) -> None:
+    if audio_debug:
+        logging.info(message)
+    else:
+        logging.debug(message)
+
+
+def audio_output_kwargs() -> dict:
+    if openai_audio_format == "wav":
+        return {"format": "wav", "acodec": "pcm_s16le", "ac": 1, "ar": 16000, "vn": None}
+    kwargs = {"format": openai_audio_format, "ac": 1, "ar": 16000, "vn": None}
+    if openai_audio_bitrate:
+        kwargs["audio_bitrate"] = openai_audio_bitrate
+    return kwargs
+
+
+def remote_audio_filename(source_name: str) -> str:
+    base = os.path.splitext(os.path.basename(source_name or "audio"))[0] or "audio"
+    extension = "wav" if openai_audio_format == "wav" else openai_audio_format
+    return f"{base}.{extension}"
+
+
+def extension_from_content_type(content_type: str | None = None) -> str:
+    normalized_content_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if not normalized_content_type:
+        return ""
+
+    extension = mimetypes.guess_extension(normalized_content_type, strict=False)
+    if extension:
+        return extension
+
+    return {
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/mpeg": ".mp3",
+        "audio/mp4": ".m4a",
+        "video/mp4": ".mp4",
+    }.get(normalized_content_type, "")
+
+
+def upload_source_name(
+    upload_filename: str | None = None,
+    video_file: str | None = None,
+    content_type: str | None = None,
+    fallback: str = "audio.wav",
+) -> str:
+    inferred_extension = extension_from_content_type(content_type) or os.path.splitext(fallback)[1]
+    for candidate in (upload_filename, video_file):
+        if candidate:
+            candidate_name = os.path.basename(candidate)
+            if candidate_name:
+                if inferred_extension and not os.path.splitext(candidate_name)[1]:
+                    return f"{candidate_name}{inferred_extension}"
+                return candidate_name
+    return fallback
+
+
+def upload_media_kind(filename: str | None = None, content_type: str | None = None) -> str:
+    normalized_content_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized_content_type.startswith("audio/"):
+        return "audio"
+    if normalized_content_type.startswith("video/"):
+        return "video"
+
+    extension = os.path.splitext(filename or "")[1].casefold()
+    if extension in AUDIO_EXTENSIONS:
+        return "audio"
+    if extension in VIDEO_EXTENSIONS:
+        return "video"
+    return "unknown"
+
+
+def safe_debug_filename(filename: str) -> str:
+    base = os.path.basename(filename or "audio")
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+
+
+def save_audio_debug_payload(audio_content: bytes, remote_name: str, source_name: str) -> None:
+    if not audio_debug_save:
+        return
+
+    try:
+        os.makedirs(audio_debug_dir, exist_ok=True)
+        digest = hashlib.sha256(audio_content).hexdigest()[:12]
+        output_path = os.path.join(audio_debug_dir, f"{digest}-{safe_debug_filename(remote_name)}")
+        with open(output_path, "wb") as debug_file:
+            debug_file.write(audio_content)
+        logging.info(f"AUDIO DEBUG saved upload payload for {source_name} to {output_path}")
+    except Exception as e:
+        logging.warning(f"AUDIO DEBUG could not save upload payload for {source_name}: {e}")
+
+
+def format_audio_track(track: dict) -> str:
+    if not track:
+        return "none"
+    language = track.get("language")
+    language_name = language.to_iso_639_2_b() if isinstance(language, LanguageCode) else str(language)
+    return (
+        f"index={track.get('index')} codec={track.get('codec')} channels={track.get('channels')} "
+        f"language={language_name} default={track.get('default')} start_time={track.get('start_time')} "
+        f"duration={track.get('duration')} title={track.get('title')}"
+    )
+
+
+def log_ffmpeg_command(stream, context: str) -> None:
+    if not audio_debug:
+        return
+    try:
+        command = " ".join(ffmpeg.compile(stream))
+        logging.info(f"AUDIO DEBUG {context} ffmpeg command: {command}")
+    except Exception as e:
+        logging.info(f"AUDIO DEBUG {context} could not compile ffmpeg command: {e}")
+
+
+def log_ffmpeg_stderr(stderr: bytes, context: str) -> None:
+    if not audio_debug or not stderr:
+        return
+    decoded = stderr.decode(errors="ignore").strip()
+    if decoded:
+        logging.info(f"AUDIO DEBUG {context} ffmpeg stderr:\n{decoded[-4000:]}")
+
+
+def wav_duration_seconds(audio_content: bytes) -> float | None:
+    try:
+        with wave.open(io.BytesIO(audio_content), "rb") as wav_file:
+            frame_rate = wav_file.getframerate()
+            if frame_rate <= 0:
+                return None
+            return wav_file.getnframes() / float(frame_rate)
+    except (wave.Error, EOFError):
+        return None
+
+
+def validate_remote_audio(audio_content: bytes, source_name: str) -> bytes:
+    digest = hashlib.sha256(audio_content).hexdigest()[:12]
+    log_audio_debug(
+        f"AUDIO DEBUG prepared payload source={source_name} remote_format={openai_audio_format} "
+        f"bytes={len(audio_content)} sha256={digest}"
+    )
+
+    if openai_audio_format != "wav":
+        return audio_content
+
+    duration = wav_duration_seconds(audio_content)
+    if duration is None:
+        logging.warning(f"Could not determine WAV duration for {source_name}")
+        return audio_content
+
+    if duration < min_remote_audio_seconds:
+        raise ValueError(
+            f"Extracted audio for {source_name} is too short "
+            f"({duration:.3f}s < {min_remote_audio_seconds:.3f}s). "
+            "Check that ffmpeg can read the input file and that the selected audio stream is correct."
         )
-        
-        # Append the new segment to the result's segments
-        result.segments.append(newSegment)
+
+    log_audio_debug(f"AUDIO DEBUG WAV duration for {source_name}: {duration:.3f}s")
+    return audio_content
+
+
+def passthrough_upload_for_remote(audio_content: bytes, source_name: str) -> tuple[bytes, str]:
+    remote_name = upload_source_name(source_name, fallback=remote_audio_filename(source_name or "audio"))
+    log_audio_debug(
+        f"AUDIO DEBUG passing through uploaded payload source={source_name} remote_name={remote_name} "
+        f"bytes={len(audio_content)}"
+    )
+
+    if os.path.splitext(remote_name)[1].casefold() == ".wav":
+        audio_content = validate_remote_audio(audio_content, source_name)
+
+    save_audio_debug_payload(audio_content, remote_name, source_name)
+    return audio_content, remote_name
+
+
+def slice_raw_pcm_upload(
+    audio_content: bytes,
+    start_time: int | None = None,
+    duration: int | None = None,
+) -> bytes:
+    start_byte = 0 if start_time is None else max(0, int(start_time * RAW_PCM_UPLOAD_BYTES_PER_SECOND))
+    end_byte = len(audio_content)
+    if duration is not None:
+        end_byte = min(len(audio_content), start_byte + max(0, int(duration * RAW_PCM_UPLOAD_BYTES_PER_SECOND)))
+    return audio_content[start_byte:end_byte]
+
+
+def pcm_bytes_to_wav(audio_content: bytes) -> bytes:
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, "wb") as wav_file:
+        wav_file.setnchannels(RAW_PCM_UPLOAD_CHANNELS)
+        wav_file.setsampwidth(RAW_PCM_UPLOAD_SAMPLE_WIDTH)
+        wav_file.setframerate(RAW_PCM_UPLOAD_SAMPLE_RATE)
+        wav_file.writeframes(audio_content)
+    return wav_buffer.getvalue()
+
+
+def normalize_raw_pcm_upload_for_remote(
+    audio_content: bytes,
+    source_name: str,
+    start_time: int | None = None,
+    duration: int | None = None,
+) -> tuple[bytes, str]:
+    raw_audio_content = slice_raw_pcm_upload(audio_content, start_time=start_time, duration=duration)
+    remote_name = remote_audio_filename(source_name)
+    log_audio_debug(
+        f"AUDIO DEBUG normalizing raw PCM upload source={source_name} input_bytes={len(audio_content)} "
+        f"sliced_bytes={len(raw_audio_content)} start_time={start_time} duration={duration} "
+        f"output_name={remote_name} output_kwargs={audio_output_kwargs()}"
+    )
+
+    if openai_audio_format == "wav":
+        out = pcm_bytes_to_wav(raw_audio_content)
+        out = validate_remote_audio(out, source_name)
+        save_audio_debug_payload(out, remote_name, source_name)
+        return out, remote_name
+
+    try:
+        stream = (
+            ffmpeg
+            .input(
+                "pipe:0",
+                format="s16le",
+                ac=RAW_PCM_UPLOAD_CHANNELS,
+                ar=RAW_PCM_UPLOAD_SAMPLE_RATE,
+            )
+            .output("pipe:1", **audio_output_kwargs())
+        )
+        log_ffmpeg_command(stream, f"raw PCM upload source={source_name}")
+        out, err = stream.run(input=raw_audio_content, capture_stdout=True, capture_stderr=True)
+        log_ffmpeg_stderr(err, f"raw PCM upload source={source_name}")
+        if not out:
+            raise ValueError(f"FFmpeg output is empty while normalizing raw PCM upload for {source_name}")
+        out = validate_remote_audio(out, source_name)
+        save_audio_debug_payload(out, remote_name, source_name)
+        return out, remote_name
+    except ffmpeg.Error as e:
+        stderr = e.stderr.decode(errors="ignore") if e.stderr else str(e)
+        raise RuntimeError(f"FFmpeg raw PCM transcode failed for {source_name}: {stderr}") from e
+
+
+def transcode_upload_pipe_for_remote(
+    audio_content: bytes,
+    source_name: str,
+    start_time: int | None = None,
+    duration: int | None = None,
+) -> tuple[bytes, str]:
+    input_kwargs = {}
+    if start_time is not None:
+        input_kwargs["ss"] = start_time
+    if duration is not None:
+        input_kwargs["t"] = duration
+
+    remote_name = remote_audio_filename(source_name)
+    log_audio_debug(
+        f"AUDIO DEBUG transcoding uploaded payload source={source_name} input_bytes={len(audio_content)} "
+        f"input_kwargs={input_kwargs} output_name={remote_name} output_kwargs={audio_output_kwargs()}"
+    )
+
+    try:
+        stream = (
+            ffmpeg
+            .input("pipe:0", **input_kwargs)
+            .output("pipe:1", **audio_output_kwargs())
+        )
+        log_ffmpeg_command(stream, f"upload source={source_name}")
+        out, err = stream.run(input=audio_content, capture_stdout=True, capture_stderr=True)
+        log_ffmpeg_stderr(err, f"upload source={source_name}")
+        if not out:
+            raise ValueError(f"FFmpeg output is empty while transcoding uploaded media for {source_name}")
+        out = validate_remote_audio(out, source_name)
+        save_audio_debug_payload(out, remote_name, source_name)
+        return out, remote_name
+    except ffmpeg.Error as e:
+        stderr = e.stderr.decode(errors="ignore") if e.stderr else str(e)
+        raise RuntimeError(f"FFmpeg pipe transcode failed for {source_name}: {stderr}") from e
+
+
+def write_upload_payload_to_tempfile(audio_content: bytes, source_name: str) -> str:
+    suffix = os.path.splitext(source_name or "")[1] or ".bin"
+    temp_file = tempfile.NamedTemporaryFile(prefix="subgen-upload-", suffix=suffix, delete=False)
+    try:
+        temp_file.write(audio_content)
+        return temp_file.name
+    finally:
+        temp_file.close()
+
+
+def transcode_upload_file_for_remote(
+    file_path: str,
+    source_name: str,
+    start_time: int | None = None,
+    duration: int | None = None,
+) -> tuple[bytes, str]:
+    input_kwargs = {}
+    if start_time is not None:
+        input_kwargs["ss"] = start_time
+    if duration is not None:
+        input_kwargs["t"] = duration
+
+    remote_name = remote_audio_filename(source_name)
+    log_audio_debug(
+        f"AUDIO DEBUG transcoding temp upload file source={source_name} temp_path={file_path} "
+        f"input_kwargs={input_kwargs} output_name={remote_name} output_kwargs={audio_output_kwargs()}"
+    )
+
+    try:
+        stream = (
+            ffmpeg
+            .input(file_path, **input_kwargs)
+            .output("pipe:1", **audio_output_kwargs())
+        )
+        log_ffmpeg_command(stream, f"temp upload source={source_name}")
+        out, err = stream.run(capture_stdout=True, capture_stderr=True)
+        log_ffmpeg_stderr(err, f"temp upload source={source_name}")
+        if not out:
+            raise ValueError(f"FFmpeg output is empty while transcoding temp upload file for {source_name}")
+        out = validate_remote_audio(out, source_name)
+        save_audio_debug_payload(out, remote_name, source_name)
+        return out, remote_name
+    except ffmpeg.Error as e:
+        stderr = e.stderr.decode(errors="ignore") if e.stderr else str(e)
+        raise RuntimeError(f"FFmpeg temp-file transcode failed for {source_name}: {stderr}") from e
+
+
+def transcode_upload_for_remote(audio_content: bytes, source_name: str, start_time: int | None = None, duration: int | None = None) -> tuple[bytes, str]:
+    try:
+        return transcode_upload_pipe_for_remote(
+            audio_content,
+            source_name,
+            start_time=start_time,
+            duration=duration,
+        )
+    except Exception as pipe_error:
+        logging.warning(f"FFmpeg pipe transcode failed for {source_name}; retrying via temp file: {pipe_error}")
+
+    temp_path = write_upload_payload_to_tempfile(audio_content, source_name)
+    try:
+        return transcode_upload_file_for_remote(
+            temp_path,
+            source_name,
+            start_time=start_time,
+            duration=duration,
+        )
+    except Exception as temp_error:
+        raise ValueError(
+            f"Could not transcode uploaded media for {source_name}. "
+            f"Pipe input failed: {pipe_error}. Temp-file retry failed: {temp_error}"
+        ) from temp_error
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError as cleanup_error:
+            logging.debug(f"Could not remove temporary upload file {temp_path}: {cleanup_error}")
+
+
+def extract_audio_for_remote(
+    file_path: str,
+    language: LanguageCode | None = None,
+    audio_tracks=None,
+    start_time: int | None = None,
+    duration: int | None = None,
+) -> tuple[bytes | None, str]:
+    remote_name = remote_audio_filename(file_path)
+    file_size = None
+    try:
+        file_size = os.path.getsize(file_path)
+    except OSError:
+        pass
+
+    if audio_tracks is None:
+        audio_tracks = get_audio_tracks(file_path)
+
+    selected_track = None
+    if audio_tracks:
+        if language:
+            selected_track = get_audio_track_by_language(audio_tracks, language)
+        if selected_track is None:
+            selected_track = audio_tracks[0]
+
+    input_kwargs = {}
+    if start_time is not None:
+        input_kwargs["ss"] = start_time
+    if duration is not None:
+        input_kwargs["t"] = duration
+
+    output_kwargs = audio_output_kwargs()
+    if selected_track is not None:
+        output_kwargs["map"] = f"0:{selected_track['index']}"
+
+    log_audio_debug(
+        f"AUDIO DEBUG extracting file={file_path} exists={os.path.exists(file_path)} size={file_size} "
+        f"tracks={len(audio_tracks)} selected_track=({format_audio_track(selected_track)}) "
+        f"input_kwargs={input_kwargs} output_name={remote_name} output_kwargs={output_kwargs}"
+    )
+
+    try:
+        stream = (
+            ffmpeg
+            .input(file_path, **input_kwargs)
+            .output("pipe:1", **output_kwargs)
+        )
+        log_ffmpeg_command(stream, f"file={file_path}")
+        out, err = stream.run(capture_stdout=True, capture_stderr=True)
+        log_ffmpeg_stderr(err, f"file={file_path}")
+        if not out:
+            raise ValueError("FFmpeg output is empty")
+        out = validate_remote_audio(out, file_path)
+        save_audio_debug_payload(out, remote_name, file_path)
+        return out, remote_name
+    except ffmpeg.Error as e:
+        stderr = e.stderr.decode(errors="ignore") if e.stderr else str(e)
+        logging.error(f"FFmpeg error extracting audio from {file_path}: {stderr}")
+        return None, remote_name
+    except Exception as e:
+        logging.error(f"Error extracting audio from {file_path}: {e}")
+        return None, remote_name
+
+
+def prepare_upload_for_remote(
+    file_content: bytes,
+    encode: bool,
+    upload_filename: str | None = None,
+    upload_content_type: str | None = None,
+    video_file: str | None = None,
+    language: LanguageCode | None = None,
+    start_time: int | None = None,
+    duration: int | None = None,
+) -> tuple[bytes, str]:
+    fallback_name = remote_audio_filename(upload_filename or video_file or "audio")
+    source_name = upload_source_name(upload_filename, video_file, upload_content_type, fallback_name)
+    upload_kind = upload_media_kind(upload_filename or source_name, upload_content_type)
+    video_file_exists = bool(video_file and os.path.isfile(video_file))
+    upload_wav_duration = wav_duration_seconds(file_content) if not encode and upload_kind == "unknown" else None
+    requires_transcode = encode or upload_kind == "video" or start_time is not None or duration is not None
+    language_name = language.to_iso_639_2_b() if language else None
+
+    log_audio_debug(
+        "AUDIO DEBUG preparing upload payload "
+        f"source_name={source_name} upload_name={upload_filename} upload_content_type={upload_content_type} "
+        f"upload_kind={upload_kind} encode={encode} video_file={video_file} video_exists={video_file_exists} "
+        f"language={language_name} start_time={start_time} duration={duration}"
+    )
+
+    if video_file_exists:
+        audio_content, remote_name = extract_audio_for_remote(
+            video_file,
+            language=language,
+            start_time=start_time,
+            duration=duration,
+        )
+        if audio_content is not None:
+            return audio_content, remote_name
+        logging.warning(
+            f"Falling back to uploaded payload for {source_name} because extraction from {video_file} failed"
+        )
+
+    if not encode and upload_kind == "unknown":
+        if upload_wav_duration is not None:
+            log_audio_debug(
+                f"AUDIO DEBUG treating encode=false upload as WAV source={source_name} duration={upload_wav_duration:.3f}s"
+            )
+            if start_time is not None or duration is not None:
+                return transcode_upload_for_remote(file_content, source_name, start_time=start_time, duration=duration)
+            return passthrough_upload_for_remote(file_content, source_name)
+
+        logging.warning(
+            f"encode=false upload {source_name} has no media metadata and is not a valid WAV file; "
+            "treating it as raw s16le PCM"
+        )
+        return normalize_raw_pcm_upload_for_remote(
+            file_content,
+            source_name,
+            start_time=start_time,
+            duration=duration,
+        )
+
+    if requires_transcode:
+        try:
+            return transcode_upload_for_remote(file_content, source_name, start_time=start_time, duration=duration)
+        except Exception as transcode_error:
+            if upload_kind == "audio" and start_time is None and duration is None:
+                logging.warning(
+                    f"Could not normalize uploaded audio for {source_name}; passing original audio through: {transcode_error}"
+                )
+                return passthrough_upload_for_remote(file_content, source_name)
+            raise
+
+    return passthrough_upload_for_remote(file_content, source_name)
+
+
+def handle_multiple_audio_tracks(file_path: str, language: LanguageCode | None = None, audio_tracks=None) -> bytes | None:
+    """
+    Backwards-compatible helper for callers/tests that only need extraction when
+    a file has multiple audio tracks. New transcription code uses
+    extract_audio_for_remote() so every upload is in an endpoint-friendly format.
+    """
+    if audio_tracks is None:
+        audio_tracks = get_audio_tracks(file_path)
+
+    if len(audio_tracks) <= 1:
+        return None
+
+    audio_track = get_audio_track_by_language(audio_tracks, language) if language else None
+    if audio_track is None:
+        audio_track = audio_tracks[0]
+
+    return extract_audio_track_to_memory(file_path, audio_track["index"])
+
+
+def extract_audio_track_to_memory(input_video_path, track_index) -> bytes | None:
+    if track_index is None:
+        logging.warning(f"Skipping audio track extraction for {input_video_path} because track index is None")
+        return None
+
+    try:
+        out, _ = (
+            ffmpeg.input(input_video_path)
+            .output("pipe:", map=f"0:{track_index}", **audio_output_kwargs())
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+        return out
+    except ffmpeg.Error as e:
+        stderr = e.stderr.decode(errors="ignore") if e.stderr else str(e)
+        logging.error(f"FFmpeg error: {stderr}")
+        return None
 
 @app.get("/plex")
 @app.get("/webhook")
@@ -535,19 +1202,23 @@ def appendLine(result):
 @app.get("/emby")
 @app.get("/detect-language")
 @app.get("/tautulli")
-def handle_get_request(request: Request):
+async def handle_get_request(request: Request):
     return {"You accessed this request incorrectly via a GET request. See https://github.com/McCloudS/subgen for proper configuration"}
 
 @app.get("/")
-def webui():
+async def webui():
     return {"The webui for configuration was removed on 1 October 2024, please configure via environment variables or in your Docker settings. "}
 
 @app.get("/status")
-def status():
-    return {"version": f"Subgen {subgen_version}, stable-ts {stable_whisper.__version__}, faster-whisper {faster_whisper.__version__} ({docker_status})"}
+async def status():
+    return {
+        "version": f"Subgen {subgen_version}, OpenAI-compatible transcription ({docker_status})",
+        "transcription_model": transcription_model,
+        "endpoint": openai_audio_url("transcribe"),
+    }
 
 @app.post("/tautulli")
-def receive_tautulli_webhook(
+async def receive_tautulli_webhook(
         source: Union[str, None] = Header(None),
         event: str = Body(None),
         file: str = Body(None),
@@ -566,7 +1237,7 @@ def receive_tautulli_webhook(
     return ""
 
 @app.post("/plex")
-def receive_plex_webhook(
+async def receive_plex_webhook(
         user_agent: Union[str] = Header(None),
         payload: Union[str] = Form(),
 ):
@@ -643,7 +1314,7 @@ def receive_plex_webhook(
     return ""
  
 @app.post("/jellyfin")
-def receive_jellyfin_webhook(
+async def receive_jellyfin_webhook(
         user_agent: str = Header(None),
         NotificationType: str = Body(None),
         file: str = Body(None),
@@ -674,7 +1345,7 @@ def receive_jellyfin_webhook(
     return ""
 
 @app.post("/emby")
-def receive_emby_webhook(
+async def receive_emby_webhook(
         user_agent: Union[str, None] = Header(None),
         data: Union[str, None] = Form(None),
 ):
@@ -698,7 +1369,7 @@ def receive_emby_webhook(
     return ""
     
 @app.post("/batch")
-def batch(
+async def batch(
         directory: str = Query(...),
         forceLanguage: Union[str, None] = Query(default=None)
 ):
@@ -775,6 +1446,8 @@ async def asr(
             'task': task,
             'language': final_language,
             'video_file': video_file,
+            'upload_filename': audio_file.filename,
+            'upload_content_type': audio_file.content_type,
             'initial_prompt': initial_prompt,
             'audio_content': file_content,
             'encode': encode,
@@ -801,9 +1474,9 @@ async def asr(
             else: 
                 logging.info(f"ASR task {task_id} completed")
                 return StreamingResponse(
-                    iter(task_result.result),
+                    iter([task_result.result]),
                     media_type="text/plain",
-                    headers={'Source': f'{task.capitalize()}d using stable-ts from Subgen!'}
+                    headers={'Source': f'{task.capitalize()}d using OpenAI-compatible endpoint from Subgen'}
                 )
         else:
             logging.error(f"ASR task {task_id} timed out")
@@ -834,8 +1507,8 @@ def get_audio_start_time(video_path: str) -> float:
     
     Some containers (especially Amazon WEB-DL) have audio streams that start
     later than the video stream. Bazarr compensates with adelay silence padding,
-    but Whisper ignores digital silence, causing all timestamps to be early by
-    the start_time offset.
+    but speech-to-text engines may ignore digital silence, causing all timestamps
+    to be early by the start_time offset.
     
     Returns the audio start_time in seconds, or 0.0 if not detectable.
     """
@@ -864,43 +1537,11 @@ def get_audio_start_time(video_path: str) -> float:
     return 0.0
 
 
-def apply_timestamp_offset(result, offset: float) -> None:
-    """
-    Shift all segment and word timestamps forward by the given offset.
-    
-    This compensates for audio start_time offsets in containers where the
-    audio stream starts later than the video stream. Whisper produces
-    timestamps relative to the audio stream start, but subtitles need
-    to be aligned to the video/container timeline.
-    
-    Note: Segment.start/end are properties that delegate to the first/last
-    word timestamps, so we only need to shift word timestamps to avoid
-    double-application. For segments without words, we shift _default_start/end.
-    """
-    if offset <= 0:
-        return
-    
-    for segment in result.segments:
-        if hasattr(segment, 'words') and segment.words:
-            for word in segment.words:
-                word.start += offset
-                word.end += offset
-        else:
-            # Segments without words use _default_start/_default_end
-            if hasattr(segment, '_default_start'):
-                segment._default_start += offset
-            if hasattr(segment, '_default_end'):
-                segment._default_end += offset
-    
-    logging.info(f"Applied +{offset:.3f}s timestamp offset to {len(result.segments)} segments")
-
-
 def asr_task_worker(task_data: dict) -> None:
     """
     Worker function that processes ASR tasks from the queue. 
     Called by transcription_worker when task type is 'asr'.
     """
-    result = None
     task_id = task_data.get('path', 'unknown')
     result_container = task_data.get('result_container')
     
@@ -908,86 +1549,49 @@ def asr_task_worker(task_data: dict) -> None:
         task = task_data['task']
         language = task_data['language']
         video_file = task_data.get('video_file')
-        _initial_prompt = task_data.get('initial_prompt')
+        upload_filename = task_data.get('upload_filename')
+        upload_content_type = task_data.get('upload_content_type')
+        initial_prompt = task_data.get('initial_prompt')
         file_content = task_data['audio_content']
         encode = task_data['encode']
-        
-        start_model()
+        output = task_data.get('output', 'srt')
 
-        args = {}
-        display_name = os.path.basename(video_file) if video_file else task_id
-        args['progress_callback'] = ProgressHandler(display_name)
-        
-        # Handle audio encoding
-        if encode:
-            args['audio'] = file_content
-        else:
-            args['audio'] = np.frombuffer(file_content, np.int16).flatten().astype(np.float32) / 32768.0
-            args['input_sr'] = 16000
-
-        if custom_regroup and custom_regroup.lower() != 'default':
-            args['regroup'] = custom_regroup
-
-        args.update(kwargs)
+        language_code = LanguageCode.from_string(language) if language else None
+        audio_content, remote_name = prepare_upload_for_remote(
+            file_content,
+            encode=encode,
+            upload_filename=upload_filename,
+            upload_content_type=upload_content_type,
+            video_file=video_file,
+            language=language_code,
+        )
         
         # Detect audio start_time offset from source file (if accessible)
         audio_offset = get_audio_start_time(video_file) if video_file else 0.0
-        
-        # Perform transcription
-        result = model.transcribe(task=task, language=language, **args, verbose=None)
-        
-        # Apply audio start_time offset to compensate for container timing
-        # Whisper ignores silence padding (adelay) from Bazarr, so timestamps
-        # are relative to audio stream start, not container start
-        if audio_offset > 0:
-            apply_timestamp_offset(result, audio_offset)
-        
-        appendLine(result)
+
+        response_format = "verbose_json" if output in {"json", "tsv"} else ("text" if output == "txt" else output)
+        response = remote_audio_request(
+            audio_content,
+            remote_name,
+            task=task,
+            language=language,
+            prompt=initial_prompt,
+            response_format=response_format,
+        )
+
+        result_text = output_from_response(response, output)
+        if output == "srt":
+            result_text = shift_srt_timestamps(result_text, audio_offset)
+            result_text = append_srt_watermark(result_text)
         
         # Set result for blocking endpoint
         if result_container:
-            result_container.set_result(result.to_srt_vtt(filepath=None, word_level=word_level_highlight))
+            result_container.set_result(result_text)
 
     except Exception as e:
         logging.error(f"Error processing ASR (ID: {task_id}): {e}", exc_info=True)
         if result_container: 
             result_container.set_error(str(e))
-    
-    finally:
-        delete_model()
-
-async def get_audio_chunk(audio_file, offset=detect_language_offset, length=detect_language_length, sample_rate=16000, audio_format=np.int16):
-    """
-    Extract a chunk of audio from a file, starting at the given offset and of the given length.
-    
-    :param audio_file: The audio file (UploadFile or file-like object).
-    :param offset: The offset in seconds to start the extraction.
-    :param length: The length in seconds for the chunk to be extracted.
-    :param sample_rate: The sample rate of the audio (default 16000).
-    :param audio_format: The audio format to interpret (default int16, 2 bytes per sample).
-    
-    :return: A numpy array containing the extracted audio chunk.
-    """
-
-    # Number of bytes per sample (for int16, 2 bytes per sample)
-    bytes_per_sample = np.dtype(audio_format).itemsize
-
-    # Calculate the start byte based on offset and sample rate
-    start_byte = offset * sample_rate * bytes_per_sample
-
-    # Calculate the length in bytes based on the length in seconds
-    length_in_bytes = length * sample_rate * bytes_per_sample
-
-    # Seek to the start position (this assumes the audio_file is a file-like object)
-    await audio_file.seek(start_byte)
-
-    # Read the required chunk of audio (length_in_bytes)
-    chunk = await audio_file.read(length_in_bytes)
-
-    # Convert the chunk into a numpy array (normalized to float32)
-    audio_data = np.frombuffer(chunk, dtype=audio_format).flatten().astype(np.float32) / 32768.0
-
-    return audio_data
 
 # ============================================================================
 # REFACTORED /DETECT-LANGUAGE ENDPOINT WITH HASH-BASED DEDUPLICATION AND BLOCKING
@@ -1001,50 +1605,46 @@ async def detect_language(
     detect_lang_length: int = Query(default=detect_language_length),
     detect_lang_offset: int = Query(default=detect_language_offset)
 ):
-    global active_direct_tasks
-    
     if force_detected_language_to: 
         await audio_file.close()
         return {"detected_language": force_detected_language_to.to_name(), "language_code": force_detected_language_to.to_iso_639_1()}
     
-    task_started = False
     try:
         file_content = await audio_file.read()
         if not file_content:
             return {"detected_language": "Unknown", "language_code": "und", "status": "error"}
             
-        logging.info("Immediate language detection (Queue Bypass)" + (f" for {video_file}" if video_file else ""))
-        
-        # Track that we are directly using the model outside the queue
-        with active_direct_tasks_lock:
-            active_direct_tasks += 1
-        task_started = True
-        
-        # --- RUN IMMEDIATELY ---
-        # EVENT LOOP BLOCK FIX: Offload heavy ops to background thread
-        await asyncio.to_thread(start_model)
-        
-        if encode:
-            audio_bytes = await asyncio.to_thread(
-                extract_audio_segment_from_content, 
-                file_content, 
-                detect_lang_offset, 
-                detect_lang_length
-            )
-            audio_data = np.frombuffer(audio_bytes, np.int16).flatten().astype(np.float32) / 32768.0
-        else:
-            audio_data = await get_audio_chunk(audio_file, detect_lang_offset, detect_lang_length)
+        logging.info("Language detection via transcription endpoint" + (f" for {video_file}" if video_file else ""))
 
-        # Offload the heavy AI inference to a background thread
-        result = await asyncio.to_thread(model.transcribe, audio_data, input_sr=16000, verbose=False)
+        audio_content, remote_name = await asyncio.to_thread(
+            prepare_upload_for_remote,
+            file_content,
+            encode,
+            audio_file.filename,
+            audio_file.content_type,
+            video_file,
+            None,
+            detect_lang_offset,
+            detect_lang_length,
+        )
+
+        result = await asyncio.to_thread(
+            remote_audio_request,
+            audio_content,
+            remote_name,
+            "transcribe",
+            None,
+            None,
+            "verbose_json",
+        )
         
-        detected = LanguageCode.from_string(result.language)
+        detected = response_language(result)
         
         logging.info(f"Detect Language Result: {detected.to_name()} ({detected.to_iso_639_1()})")
         
         return {
-            "detected_language": detected.to_name(),
-            "language_code": detected.to_iso_639_1()
+            "detected_language": detected.to_name() or "Unknown",
+            "language_code": detected.to_iso_639_1() or "und"
         }
 
     except Exception as e: 
@@ -1052,11 +1652,6 @@ async def detect_language(
         return {"detected_language": "Unknown", "language_code": "und", "status": "error"}
     finally: 
         await audio_file.close()
-        # Decrement counter so delete_model() knows we are done
-        if task_started:
-            with active_direct_tasks_lock:
-                active_direct_tasks -= 1
-            delete_model() # Schedules VRAM cleanup if system is idle
 
 # ============================================================================
 # DETECT LANGUAGE WORKER FOR UPLOADED AUDIO
@@ -1073,6 +1668,8 @@ def detect_language_from_upload(task_data: dict) -> None:
     
     try:
         video_file = task_data.get('video_file')
+        upload_filename = task_data.get('upload_filename')
+        upload_content_type = task_data.get('upload_content_type')
         file_content = task_data['audio_content']
         encode = task_data['encode']
         detect_lang_length = task_data['detect_lang_length']
@@ -1083,38 +1680,32 @@ def detect_language_from_upload(task_data: dict) -> None:
             if video_file
             else f"Detecting language ({detect_lang_length}s starting at {detect_lang_offset}s) - ID: {task_id}"
         )
-        
-        start_model()
 
-        args = {}
-        args['progress_callback'] = None
-        
-        # Handle audio extraction
-        if encode:
-            audio_bytes = extract_audio_segment_from_content(
-                file_content, 
-                detect_lang_offset, 
-                detect_lang_length
-            )
-            args['audio'] = audio_bytes
-            args['input_sr'] = 16000
-        else:
-            args['audio'] = np.frombuffer(file_content, np.int16).flatten().astype(np.float32) / 32768.0
-            args['input_sr'] = 16000
+        audio_content, remote_name = prepare_upload_for_remote(
+            file_content,
+            encode=encode,
+            upload_filename=upload_filename,
+            upload_content_type=upload_content_type,
+            video_file=video_file,
+            start_time=detect_lang_offset,
+            duration=detect_lang_length,
+        )
 
-        args.update(kwargs)
-        args['verbose'] = False # Hide the confusing progress bar
-        
-        result = model.transcribe(**args)
-        detected_language = LanguageCode.from_string(result.language)
-        language_code = detected_language.to_iso_639_1()
+        result = remote_audio_request(
+            audio_content,
+            remote_name,
+            task="transcribe",
+            response_format="verbose_json",
+        )
+        detected_language = response_language(result)
+        language_code = detected_language.to_iso_639_1() or "und"
         
         logging.info(f"Detected language: {detected_language.to_name()} ({language_code}) - ID: {task_id}")
         
         # Set the result for the blocking endpoint
         if result_container:
             result_container.set_result({
-                "detected_language": detected_language.to_name(),
+                "detected_language": detected_language.to_name() or "Unknown",
                 "language_code": language_code
             })
 
@@ -1128,47 +1719,6 @@ def detect_language_from_upload(task_data: dict) -> None:
         if result_container: 
             result_container.set_error(str(e))
     
-    finally:
-        delete_model()
-
-# ============================================================================
-# HELPER: Extract audio segment from in-memory content
-# ============================================================================
-
-def extract_audio_segment_from_content(audio_content: bytes, start_time: int, duration: int) -> bytes:
-    """
-    Extract a segment of audio from in-memory content using FFmpeg.
-    
-    Args:
-        audio_content: Raw audio bytes
-        start_time: Start time in seconds
-        duration: Duration in seconds
-        
-    Returns:
-        Audio bytes of the extracted segment
-    """
-    try: 
-        logging.info(f"Extracting audio segment: start_time={start_time}s, duration={duration}s")
-        
-        out, _ = (
-            ffmpeg
-            .input('pipe:0', ss=start_time, t=duration)
-            .output('pipe:1', format='wav', acodec='pcm_s16le', ar=16000)
-            .run(input=audio_content, capture_stdout=True, capture_stderr=True)
-        )
-        
-        if not out:
-            raise ValueError("FFmpeg output is empty")
-        
-        return out
-
-    except ffmpeg.Error as e:
-        logging.error(f"FFmpeg error: {e.stderr.decode()}")
-        return audio_content # Fallback to original if extraction fails
-    except Exception as e:
-        logging.error(f"Error extracting audio segment: {str(e)}")
-        return audio_content # Fallback to original
-
 def detect_language_task(path, original_task_data=None):
     """
     Worker function that detects language for a local file.
@@ -1181,26 +1731,27 @@ def detect_language_task(path, original_task_data=None):
             f"Detecting language of file: {path} "
             f"({detect_language_length}s starting at {detect_language_offset}s)"
         )
-        
-        start_model()
-        
-        audio_segment = extract_audio_segment_to_memory(
-            path, 
-            detect_language_offset, 
-            int(detect_language_length)
+
+        audio_content, remote_name = extract_audio_for_remote(
+            path,
+            start_time=detect_language_offset,
+            duration=int(detect_language_length),
         )
-        
-        # FIX: Hide confusing progress bar and use from_string for ISO codes
-        result = model.transcribe(audio_segment, verbose=False)
-        detected_language = LanguageCode.from_string(result.language)
+        if audio_content is None:
+            raise ValueError("Could not extract audio for language detection")
+
+        result = remote_audio_request(
+            audio_content,
+            remote_name,
+            task="transcribe",
+            response_format="verbose_json",
+        )
+        detected_language = response_language(result)
         
         logging.info(f"Detected language: {detected_language.to_name()}")
 
     except Exception as e:
         logging.error(f"Error detecting language for file: {e}", exc_info=True)
-        
-    finally:
-        delete_model()
         
     # Create transcription task with detected language
     task_data = {
@@ -1218,152 +1769,12 @@ def detect_language_task(path, original_task_data=None):
                 
     return task_data
 
-def extract_audio_segment_to_memory(input_file, start_time, duration):
-    """
-    Extract a segment of audio from input_file, starting at start_time for duration seconds.
-    
-    :param input_file: UploadFile object or path to the input audio file
-    :param start_time: Start time in seconds (e.g., 60 for 1 minute)
-    :param duration: Duration in seconds (e.g., 30 for 30 seconds)
-    :return: bytes containing the audio segment, or None on error
-    
-    Changed to return bytes directly instead of BytesIO to prevent memory leak.
-    Previously returned BytesIO objects were never closed, causing 480KB-10MB leak per call.
-    """
-    try:
-        if hasattr(input_file, 'file') and hasattr(input_file.file, 'read'): # Handling UploadFile
-            input_file.file.seek(0) # Ensure the file pointer is at the beginning
-            input_stream = 'pipe:0'
-            input_kwargs = {'input': input_file.file.read()}
-        elif isinstance(input_file, str): # Handling local file path
-            input_stream = input_file
-            input_kwargs = {}
-        else:
-            raise ValueError("Invalid input: input_file must be a file path or an UploadFile object.")
-
-        logging.info(f"Extracting audio from: {input_stream}, start_time: {start_time}, duration: {duration}")
-
-        # Run FFmpeg to extract the desired segment
-        out, _ = (
-            ffmpeg
-            .input(input_stream, ss=start_time, t=duration) # Set start time and duration
-            .output('pipe:1', format='wav', acodec='pcm_s16le', ar=16000) # Output to pipe as WAV
-            .run(capture_stdout=True, capture_stderr=True, **input_kwargs)
-        )
-
-        # Check if the output is empty or null
-        if not out:
-            raise ValueError("FFmpeg output is empty, possibly due to invalid input.")
-        
-        # Return bytes directly instead of BytesIO to prevent memory leak
-        return out
-
-    except ffmpeg.Error as e:
-        logging.error(f"FFmpeg error: {e.stderr.decode()}")
-        return None
-    except Exception as e: 
-        logging.error(f"Error: {str(e)}")
-        return None
-
-def start_model():
-    global model
-    with model_load_lock:
-        if model is None:
-            logging.debug("Model was purged, need to re-create")
-            model = stable_whisper.load_faster_whisper(whisper_model, download_root=model_location, device=transcribe_device, cpu_threads=whisper_threads, num_workers=concurrent_transcriptions, compute_type=compute_type)
-
-def schedule_model_cleanup():
-    """Schedule model cleanup with a delay to allow concurrent requests.
-    
-    Properly joins cancelled timers to prevent thread accumulation."""
-    global model_cleanup_timer, model_cleanup_lock
-    
-    previous_timer = None
-    with model_cleanup_lock:
-        # Cancel any existing timer
-        if model_cleanup_timer is not None:
-            model_cleanup_timer.cancel()
-            logging.debug("Cancelled previous model cleanup timer")
-            previous_timer = model_cleanup_timer
-
-        # Schedule a new cleanup timer
-        model_cleanup_timer = Timer(model_cleanup_delay, perform_model_cleanup)
-        model_cleanup_timer.daemon = True
-        model_cleanup_timer.start()
-        logging.debug(f"Model cleanup scheduled in {model_cleanup_delay} seconds")
-
-    # Join outside the lock to avoid deadlock if the callback already started
-    if previous_timer is not None:
-        previous_timer.join(timeout=1)
-
-def perform_model_cleanup():
-    """Actually perform the model cleanup."""
-    global model, model_cleanup_timer, model_cleanup_lock, active_direct_tasks
-    
-    with model_cleanup_lock: 
-        logging.debug("Executing scheduled model cleanup")
-        
-        with active_direct_tasks_lock:
-            system_is_idle = task_queue.is_idle() and active_direct_tasks == 0
-            
-        if clear_vram_on_complete and system_is_idle:
-            logging.debug("Queue and direct tasks idle; clearing model from memory.")
-            if model: 
-                try:
-                    model.model.unload_model()
-                    del model
-                    model = None
-                    logging.info("Model unloaded from memory")
-                except Exception as e:
-                    logging.error(f"Error unloading model: {e}")
-            
-            if transcribe_device.lower() == 'cuda' and torch.cuda.is_available():
-                try:
-                    torch.cuda.empty_cache()
-                    logging.debug("CUDA cache cleared.")
-                except Exception as e: 
-                    logging.error(f"Error clearing CUDA cache: {e}")
-        else:
-            logging.debug("Queue not idle or clear_vram disabled; skipping model cleanup")
-        
-        if os.name != 'nt': # don't garbage collect on Windows
-            gc.collect()
-            ctypes.CDLL(ctypes.util.find_library('c')).malloc_trim(0)
-        
-        model_cleanup_timer = None
-
-def delete_model():
-    """
-    Only schedules a cleanup timer if the system is actually idle.
-    This prevents unnecessary timer resets when a large batch is being processed.
-    """
-    global active_direct_tasks
-    # 1. If we aren't supposed to clear VRAM, don't bother with timers at all.
-    if not clear_vram_on_complete:
-        return
-
-    # 2. Only schedule cleanup if the queue is empty AND no other workers are processing.
-    with active_direct_tasks_lock:
-        system_is_idle = task_queue.is_idle() and active_direct_tasks == 0
-
-    if system_is_idle:
-        schedule_model_cleanup()
-    else:
-        # If there are 10 items left in the queue, we simply do nothing. 
-        # The very last worker to finish the last item will trigger the timer.
-        logging.debug("Tasks still in queue or processing; skipping model cleanup scheduling.")
-
 def is_audio_file_extension(file_extension):
     return file_extension.casefold() in AUDIO_EXTENSIONS
 
-def write_lrc(result, file_path):
+def write_lrc(lrc_text, file_path):
     with open(file_path, "w") as file:
-        for segment in result.segments:
-            minutes, seconds = divmod(int(segment.start), 60)
-            fraction = int((segment.start - int(segment.start)) * 100)
-            # remove embedded newlines in text, since some players ignore text after newlines
-            text = segment.text[:].replace('\n', '')
-            file.write(f"[{minutes:02d}:{seconds:02d}.{fraction:02d}]{text}\n")
+        file.write(lrc_text)
 
 def send_completion_webhook(source_file_path: str, subtitle_file_path: str, language: LanguageCode, task_type: str):
     """Sends a JSON POST request to a configured webhook URL upon task completion."""
@@ -1399,41 +1810,38 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language: Langu
     """
 
     try:
-        start_model()
-
         # Check if the file is an audio file before trying to extract audio
         file_name, file_extension = os.path.splitext(file_path)
         is_audio_file = is_audio_file_extension(file_extension)
 
-        data = file_path
-        # Extract audio from the file if it has multiple audio tracks
-        extracted_audio_file = handle_multiple_audio_tracks(file_path, force_language, audio_tracks=audio_tracks)
-        if extracted_audio_file:
-            data = extracted_audio_file
-        
-        args = {}
-        display_name = os.path.basename(file_path)
-        args['progress_callback'] = ProgressHandler(display_name)
-            
-        if custom_regroup and custom_regroup.lower() != 'default':
-            args['regroup'] = custom_regroup
-            
-        args.update(kwargs)
-        
-        result = model.transcribe(data, language=force_language.to_iso_639_1(), task=transcription_type, verbose=None, **args)
+        audio_content, remote_name = extract_audio_for_remote(
+            file_path,
+            force_language,
+            audio_tracks=audio_tracks,
+        )
+        if audio_content is None:
+            raise ValueError("Could not extract audio for transcription")
 
-        appendLine(result)
+        response = remote_audio_request(
+            audio_content,
+            remote_name,
+            task=transcription_type,
+            language=force_language.to_iso_639_1() if force_language else None,
+            response_format="verbose_json",
+        )
 
-        output_language = LanguageCode.from_string(result.language)
+        output_language = response_language(response, fallback=force_language, task=transcription_type)
         subtitle_file_path = ""
 
         # If it is an audio file, write the LRC file
         if is_audio_file and lrc_for_audio_files:
             subtitle_file_path = file_name + '.lrc'
-            write_lrc(result, subtitle_file_path)
+            write_lrc(response_to_lrc(response), subtitle_file_path)
         else:
             subtitle_file_path = name_subtitle(file_path, output_language)
-            result.to_srt_vtt(subtitle_file_path, word_level=word_level_highlight)
+            srt_text = append_srt_watermark(response_to_srt(response))
+            with open(subtitle_file_path, "w") as file:
+                file.write(srt_text)
             
         # Trigger the downstream webhook
         send_completion_webhook(file_path, subtitle_file_path, output_language, transcription_type)
@@ -1441,7 +1849,7 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language: Langu
         # FIX: Provide the generated subtitle result to any waiting ASR endpoint requests
         with task_results_lock:
             if file_path in task_results:
-                task_results[file_path].set_result(result.to_srt_vtt(filepath=None, word_level=word_level_highlight))
+                task_results[file_path].set_result(response_to_srt(response))
 
     except Exception as e:
         logging.info(f"Error processing or transcribing {file_path} in {force_language}: {e}")
@@ -1449,9 +1857,6 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language: Langu
         with task_results_lock:
             if file_path in task_results:
                 task_results[file_path].set_error(str(e))
-
-    finally:
-        delete_model()
         
 def define_subtitle_language_naming(language: LanguageCode, type):
     """
@@ -1490,89 +1895,11 @@ def name_subtitle(file_path: str, language: LanguageCode) -> str:
         The name of the subtitle file to be written.
     """
     subgen_part = ".subgen" if show_in_subname_subgen else ""
-    model_part = f".{whisper_model}" if show_in_subname_model else ""
+    model_part = f".{transcription_model}" if show_in_subname_model else ""
     lang_part = define_subtitle_language_naming(language, subtitle_language_naming_type)
     
     return f"{os.path.splitext(file_path)[0]}{subgen_part}{model_part}.{lang_part}.srt"
     
-def handle_multiple_audio_tracks(file_path: str, language: LanguageCode | None = None, audio_tracks=None) -> bytes | None:
-    """
-    Handles the possibility of a media file having multiple audio tracks.
-
-    Returns bytes directly instead of BytesIO to prevent memory leak.
-    If the media file has multiple audio tracks, extracts the audio track of
-    the selected language; otherwise extracts the first audio track.
-
-    Parameters:
-    file_path (str): The path to the media file.
-    language (LanguageCode | None): The language of the audio track to search for.
-    audio_tracks: Pre-fetched audio track list; fetched from file if not provided.
-
-    Returns:
-    bytes | None: The audio data as bytes, or None if no audio track was extracted.
-    """
-    audio_bytes = None
-    if audio_tracks is None:
-        audio_tracks = get_audio_tracks(file_path)
-
-    if len(audio_tracks) > 1:
-        logging.debug(f"Handling multiple audio tracks from {file_path} and planning to extract audio track of language {language}")
-        logging.debug(
-            "Audio tracks:\n"
-            + "\n".join([f"  - {track['index']}: {track['codec']} {track['language']} {('default' if track['default'] else '')}" for track in audio_tracks])
-        )
-
-        audio_track = None
-        if language is not None:
-            audio_track = get_audio_track_by_language(audio_tracks, language)
-        if audio_track is None:
-            audio_track = audio_tracks[0]
-        
-        audio_bytes = extract_audio_track_to_memory(file_path, audio_track["index"])
-        if audio_bytes is None:
-            logging.error(f"Failed to extract audio track {audio_track['index']} from {file_path}")
-            return None
-    return audio_bytes
-
-def extract_audio_track_to_memory(input_video_path, track_index) -> bytes | None:
-    """
-    Extract a specific audio track from a video file to memory using FFmpeg. 
-
-    Args:
-        input_video_path (str): The path to the video file.
-        track_index (int): The index of the audio track to extract. If None, skip extraction.
-
-    Returns:
-        bytes | None: The audio data as bytes, or None if extraction failed.
-        
-        Changed to return bytes directly instead of BytesIO to prevent memory leak.
-        Previously returned BytesIO objects were never closed, causing memory leaks.
-    """
-    if track_index is None:
-        logging.warning(f"Skipping audio track extraction for {input_video_path} because track index is None")
-        return None
-
-    try:
-        # Use FFmpeg to extract the specific audio track and output to memory
-        out, _ = (
-            ffmpeg.input(input_video_path)
-            .output(
-                "pipe:", # Direct output to a pipe
-                map=f"0:{track_index}", # Select the specific audio track
-                format="wav", # Output format
-                ac=1, # Mono audio (optional)
-                ar=16000, # Sample rate 16 kHz (recommended for speech models)
-                loglevel="quiet"
-            )
-            .run(capture_stdout=True, capture_stderr=True) # Capture output in memory
-        )
-        # Return bytes directly instead of BytesIO to prevent memory leak
-        return out
-
-    except ffmpeg.Error as e:
-        logging.error(f"FFmpeg error: {e.stderr.decode()}")
-        return None
-
 def get_audio_track_by_language(audio_tracks, language):
     """
     Returns the first audio track with the given language. 
@@ -1659,12 +1986,20 @@ def get_audio_tracks(video_file):
                 "channels": int(stream.get("channels", 0)),
                 "language": LanguageCode.from_iso_639_2(stream.get("tags", {}).get("language", "Unknown")),
                 "title": stream.get("tags", {}).get("title", "None"),
+                "start_time": stream.get("start_time"),
+                "duration": stream.get("duration"),
                 "default": stream.get("disposition", {}).get("default", 0) == 1,
                 "forced": stream.get("disposition", {}).get("forced", 0) == 1,
                 "original": stream.get("disposition", {}).get("original", 0) == 1,
                 "commentary": "commentary" in stream.get("tags", {}).get("title", "").lower()
             }
             audio_tracks.append(audio_track) 
+
+        log_audio_debug(
+            "AUDIO DEBUG probed audio tracks for "
+            f"{video_file}: "
+            + ("; ".join(format_audio_track(track) for track in audio_tracks) if audio_tracks else "none")
+        )
         return audio_tracks
 
     except ffmpeg.Error as e:
@@ -1729,7 +2064,7 @@ def gen_subtitles_queue(file_path: str, transcription_type: str, force_language:
     if should_skip_file(file_path, force_language, audio_langs=audio_langs):
         return
 
-    # Detect audio language via Whisper if no language is known and detection is enabled
+    # Detect audio language via the transcription endpoint if no language is known and detection is enabled
     if not force_language and should_whisper_detect_audio_language:
         detect_task = {'path': file_path, 'type': "detect_language"}
         detect_task.update(task_kwargs)
@@ -2327,7 +2662,6 @@ def transcribe_existing(transcribe_folders, forceLanguage: LanguageCode = Langua
 if __name__ == "__main__":
     import uvicorn
     logging.info(f"Subgen v{subgen_version}")
-    logging.info(f"Threads: {str(whisper_threads)}, Concurrent transcriptions: {str(concurrent_transcriptions)}")
-    logging.info(f"Transcribe device: {transcribe_device}, Model: {whisper_model}")
-    os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
+    logging.info(f"Concurrent transcriptions: {str(concurrent_transcriptions)}")
+    logging.info(f"Transcription endpoint: {openai_audio_url('transcribe')}, Model: {transcription_model}")
     uvicorn.run("__main__:app", host="0.0.0.0", port=int(webhookport), reload=reload_script_on_change, use_colors=True)

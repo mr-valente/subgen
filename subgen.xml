@@ -1,56 +1,52 @@
 <?xml version="1.0"?>
 <Container version="2">
     <Name>subgen</Name>
-  <ExtraParams>--gpus all</ExtraParams>
-	<Beta>false</Beta>
-	<Category>CATEGORY:</Category>
-    <Repository>mccloud/subgen</Repository>
-    <Registry>https://github.com/McCloudS/subgen</Registry>
-    <DonateText>If you appreciate my work, then please consider donating</DonateText>
-    <DonateLink>https://www.paypal.com/donate/?hosted_button_id=SU4QQP6LH5PF6</DonateLink>
-    <DonateImg>https://www.paypal.com/en_US/i/btn/btn_donate_SM.gif</DonateImg>
+    <Beta>false</Beta>
+    <Category>MediaApp:Video</Category>
+    <Repository>subgen-openai</Repository>
     <Network>bridge</Network>
     <Privileged>false</Privileged>
-    <Support>https://github.com/McCloudS/subgen/issues</Support>
     <Shell>bash</Shell>
-    <GitHub>https://github.com/McCloudS/subgen</GitHub>
-    <ReadMe>https://github.com/McCloudS/subgen/blob/main/README.md</ReadMe>
-    <Project>https://github.com/McCloudS/subgen</Project>
-    <Overview>subgen will transcribe your personal media on a Plex, Emby, or Jellyfin server to create subtitles (.srt) from audio/video files, it can also be used as a Whisper Provider in Bazarr</Overview>
+    <Overview>Subgen creates subtitles for personal media and forwards transcription work to an OpenAI-compatible audio endpoint. It can also be used as a Whisper Provider in Bazarr.</Overview>
     <WebUI>http://[IP]:[PORT:9000]/docs</WebUI>
-    <TemplateURL>https://github.com/McCloudS/subgen/blob/main/subgen.xml</TemplateURL>
     <Icon>https://raw.githubusercontent.com/McCloudS/subgen/main/icon.png</Icon>
-    <Date>2024-03-23</Date>
-    <Changes></Changes>
-    <Config Name="Port: Webhook Port" Target="9000" Default="9000" Mode="tcp" Description="This is the port for the webhook" Type="Port" Display="always" Required="true" Mask="false"/>
-    <Config Name="Path: /subgen" Target="/subgen" Default="/mnt/user/appdata/subgen" Mode="rw" Description="This is the container path to your configuration files." Type="Path" Display="always" Required="true" Mask="false"/>
-    <Config Name="Variable: TRANSCRIBE_DEVICE" Target="TRANSCRIBE_DEVICE" Default="gpu" Description="Can transcribe via gpu (Cuda only) or cpu. Takes option of 'cpu', 'gpu', 'cuda'." Type="Variable" Display="always" Required="false" Mask="false"/>
-    <Config Name="Variable: WHISPER_MODEL" Target="WHISPER_MODEL" Default="medium" Description="Can be:'tiny', 'tiny.en', 'base', 'base.en', 'small', 'small.en', 'medium', 'medium.en', 'large-v1','large-v2', 'large-v3', 'large', 'distil-large-v2', 'distil-medium.en', 'distil-small.en'" Type="Variable" Display="always" Required="false" Mask="false"/>
-    <Config Name="Variable: CONCURRENT_TRANSCRIPTIONS" Target="CONCURRENT_TRANSCRIPTIONS" Default="2" Description="Number of files it will transcribe in parallel" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: WHISPER_THREADS" Target="WHISPER_THREADS" Default="4" Description="number of threads to use during computation" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: MODEL_PATH" Target="MODEL_PATH" Default="./models" Description="This is where the WHISPER_MODEL will be stored. This defaults to placing it where you execute the script in the folder 'models'" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: PROCADDEDMEDIA" Target="PROCADDEDMEDIA" Default="True" Description="will gen subtitles for all media added regardless of existing external/embedded subtitles (based off of SKIPIFINTERNALSUBLANG)" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: PROCMEDIAONPLAY" Target="PROCMEDIAONPLAY" Default="True" Description="will gen subtitles for all played media regardless of existing external/embedded subtitles (based off of SKIPIFINTERNALSUBLANG)" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: NAMESUBLANG" Target="NAMESUBLANG" Default="aa" Description="allows you to pick what it will name the subtitle. Instead of using EN, I'm using AA, so it doesn't mix with exiting external EN subs, and AA will populate higher on the list in Plex." Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: SKIPIFINTERNALSUBLANG" Target="SKIPIFINTERNALSUBLANG" Default="eng" Description="Will not generate a subtitle if the file has an internal sub matching the 3 letter code of this variable (See https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes)" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: WORD_LEVEL_HIGHLIGHT" Target="WORD_LEVEL_HIGHLIGHT" Default="False" Description="Highlights each words as it's spoken in the subtitle. See example video @ https://github.com/jianfch/stable-ts" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: PLEXSERVER" Target="PLEXSERVER" Default="http://plex:32400" Description="This needs to be set to your local plex server address/port" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: PLEXTOKEN" Target="PLEXTOKEN" Default="token here" Description="This needs to be set to your plex token found by https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: JELLYFINSERVER" Target="JELLYFINSERVER" Default="http://jellyfin:8096" Description="Set to your Jellyfin server address/port" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: JELLYFINTOKEN" Target="JELLYFINTOKEN" Default="token here" Description="Generate a token inside the Jellyfin interface" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: WEBHOOKPORT" Target="WEBHOOKPORT" Default="9000" Description="Change this if you need a different port for your webhook" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: TRANSCRIBE_FOLDERS" Target="TRANSCRIBE_FOLDERS" Default="" Description="Takes a pipe '|' separated list (For example: /tv|/movies|/familyvideos) and iterates through and adds those files to be queued for subtitle generation if they don't have internal subtitles" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: TRANSCRIBE_OR_TRANSLATE" Target="TRANSCRIBE_OR_TRANSLATE" Default="transcribe" Description="Takes either 'transcribe' or 'translate'. Transcribe will transcribe the audio in the same language as the input. Translate will transcribe and translate into English." Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: COMPUTE_TYPE" Target="COMPUTE_TYPE" Default="auto" Description="Set compute-type using the following information: https://github.com/OpenNMT/CTranslate2/blob/master/docs/quantization.md" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: DEBUG" Target="DEBUG" Default="True" Description="Provides some debug data that can be helpful to troubleshoot path mapping and other issues." Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: FORCE_DETECTED_LANGUAGE_TO" Target="FORCE_DETECTED_LANGUAGE_TO" Default="" Description="This is to force the model to a language instead of the detected one, takes a 2 letter language code. For example, your audio is French but keeps detecting as English, you would set it to 'fr'" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: CLEAR_VRAM_ON_COMPLETE" Target="CLEAR_VRAM_ON_COMPLETE" Default="False" Description="This will delete the model and do garbage collection when queue is empty. Good if you need to use the VRAM for something else." Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: UPDATE" Target="UPDATE" Default="True" Description="Will pull latest subgen.py from the repository if True. False will use the original subgen.py built into the Docker image. Standalone users can use this with launcher.py to get updates." Type="Variable" Display="always" Required="false" Mask="false"/>
-    <Config Name="Variable: APPEND" Target="APPEND" Default="False" Description="Will add the following at the end of a subtitle: 'Transcribed by whisperAI with faster-whisper ({whisper_model}) on {datetime.now()}'" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: MONITOR" Target="MONITOR" Default="False" Description="Will monitor TRANSCRIBE_FOLDERS for real-time changes to see if we need to generate subtitles" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: USE_MODEL_PROMPT" Target="USE_MODEL_PROMPT" Default="False" Description="When set to True, will use the default prompt stored in greetings_translations 'Hello, welcome to my lecture.' to try and force the use of punctuation in transcriptions that don't." Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: CUSTOM_MODEL_PROMPT" Target="CUSTOM_MODEL_PROMPT" Default="" Description="If USE_MODEL_PROMPT is True, you can override the default prompt (See: https://medium.com/axinc-ai/prompt-engineering-in-whisper-6bb18003562d for great examples)." Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: LRC_FOR_AUDIO_FILES" Target="LRC_FOR_AUDIO_FILES" Default="True" Description="Will generate LRC (instead of SRT) files for filetypes: '.mp3', '.flac', '.wav', '.alac', '.ape', '.ogg', '.wma', '.m4a', '.m4b', '.aac', '.aiff'" Type="Variable" Display="advanced" Required="false" Mask="false"/>
-    <Config Name="Variable: CUSTOM_REGROUP" Target="CUSTOM_REGROUP" Default="cm_sl=84_sl=42++++++1" Description="Attempts to regroup some of the segments to make a cleaner looking subtitle. See Issue #68 for discussion. Set to blank if you want to use Stable-TS default regroups algorithm of cm_sp=,* /，_sg=.5_mg=.3+3_sp=.* /。/?/？'" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Date>2026-05-11</Date>
+    <Changes>Removed local Whisper, GPU, model-cache, and self-update settings. Added OpenAI-compatible audio endpoint settings.</Changes>
 
+    <Config Name="Port: Webhook Port" Target="9000" Default="9000" Mode="tcp" Description="FastAPI port for webhooks and Bazarr requests." Type="Port" Display="always" Required="true" Mask="false"/>
+    <Config Name="Path: /tv" Target="/tv" Default="/mnt/user/media/tv" Mode="rw" Description="Optional TV media path. Mount paths exactly as your media server sees them when using webhooks or Bazarr Pass Video Name." Type="Path" Display="always" Required="false" Mask="false"/>
+    <Config Name="Path: /movies" Target="/movies" Default="/mnt/user/media/movies" Mode="rw" Description="Optional movie media path. Mount paths exactly as your media server sees them when using webhooks or Bazarr Pass Video Name." Type="Path" Display="always" Required="false" Mask="false"/>
+
+    <Config Name="Variable: OPENAI_BASE_URL" Target="OPENAI_BASE_URL" Default="https://api.openai.com/v1" Description="Base URL for the OpenAI-compatible API." Type="Variable" Display="always" Required="true" Mask="false"/>
+    <Config Name="Variable: OPENAI_API_KEY" Target="OPENAI_API_KEY" Default="" Description="Bearer token for the OpenAI-compatible API. Leave empty only if your endpoint does not require auth." Type="Variable" Display="always" Required="false" Mask="true"/>
+    <Config Name="Variable: OPENAI_TRANSCRIPTION_MODEL" Target="OPENAI_TRANSCRIPTION_MODEL" Default="whisper-1" Description="Model sent to /audio/transcriptions." Type="Variable" Display="always" Required="false" Mask="false"/>
+    <Config Name="Variable: OPENAI_TRANSLATION_MODEL" Target="OPENAI_TRANSLATION_MODEL" Default="whisper-1" Description="Model sent to /audio/translations." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: OPENAI_AUDIO_FORMAT" Target="OPENAI_AUDIO_FORMAT" Default="wav" Description="Audio format Subgen creates before upload. WAV is the safest default for whisper.cpp-compatible servers." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: OPENAI_AUDIO_BITRATE" Target="OPENAI_AUDIO_BITRATE" Default="64k" Description="Bitrate for compressed upload formats." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: MIN_REMOTE_AUDIO_SECONDS" Target="MIN_REMOTE_AUDIO_SECONDS" Default="0.1" Description="Reject extracted WAV payloads shorter than this before sending them to the endpoint." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: AUDIO_DEBUG" Target="AUDIO_DEBUG" Default="False" Description="Log audio stream discovery, selected track, ffmpeg command/stderr, payload byte size, hash, and WAV duration." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: AUDIO_DEBUG_SAVE" Target="AUDIO_DEBUG_SAVE" Default="False" Description="Save the exact upload payload for inspection." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: AUDIO_DEBUG_DIR" Target="AUDIO_DEBUG_DIR" Default="/tmp/subgen-audio-debug" Description="Directory used when AUDIO_DEBUG_SAVE=True." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: OPENAI_API_TIMEOUT" Target="OPENAI_API_TIMEOUT" Default="18000" Description="Audio API timeout and /asr wait timeout in seconds." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+    <Config Name="Variable: WEBHOOK_PORT" Target="WEBHOOK_PORT" Default="9000" Description="FastAPI listening port inside the container." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: CONCURRENT_TRANSCRIPTIONS" Target="CONCURRENT_TRANSCRIPTIONS" Default="2" Description="Number of worker threads sending requests to the endpoint." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: PROCESS_ADDED_MEDIA" Target="PROCESS_ADDED_MEDIA" Default="True" Description="Generate subtitles for added-media webhook events." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: PROCESS_MEDIA_ON_PLAY" Target="PROCESS_MEDIA_ON_PLAY" Default="True" Description="Generate subtitles for playback-start webhook events." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: TRANSCRIBE_FOLDERS" Target="TRANSCRIBE_FOLDERS" Default="" Description="Pipe-separated list of paths to scan, for example /tv|/movies." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: TRANSCRIBE_OR_TRANSLATE" Target="TRANSCRIBE_OR_TRANSLATE" Default="transcribe" Description="Use transcribe or translate." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: DEBUG" Target="DEBUG" Default="True" Description="Enable verbose logs." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+    <Config Name="Variable: SUBTITLE_LANGUAGE_NAME" Target="SUBTITLE_LANGUAGE_NAME" Default="aa" Description="Override the language part of generated subtitle filenames." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: SKIP_IF_INTERNAL_SUBTITLES_LANGUAGE" Target="SKIP_IF_INTERNAL_SUBTITLES_LANGUAGE" Default="eng" Description="Skip when the file has an embedded subtitle in this language." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: PREFERRED_AUDIO_LANGUAGES" Target="PREFERRED_AUDIO_LANGUAGES" Default="eng" Description="Pipe-separated audio languages to prefer for multi-track media." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: FORCE_DETECTED_LANGUAGE_TO" Target="FORCE_DETECTED_LANGUAGE_TO" Default="" Description="Force a two-letter source language code." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: SHOULD_DETECT_AUDIO_LANGUAGE" Target="SHOULD_DETECT_AUDIO_LANGUAGE" Default="False" Description="Use the transcription endpoint to detect language when media metadata is unknown." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: APPEND" Target="APPEND" Default="False" Description="Append a short Subgen watermark to generated SRT files." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: LRC_FOR_AUDIO_FILES" Target="LRC_FOR_AUDIO_FILES" Default="True" Description="Generate LRC instead of SRT for pure audio files." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+    <Config Name="Variable: PLEX_SERVER" Target="PLEX_SERVER" Default="http://plex:32400" Description="Plex server URL for webhooks and metadata refresh." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: PLEX_TOKEN" Target="PLEX_TOKEN" Default="" Description="Plex token." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+    <Config Name="Variable: JELLYFIN_SERVER" Target="JELLYFIN_SERVER" Default="http://jellyfin:8096" Description="Jellyfin server URL for webhooks and metadata refresh." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Variable: JELLYFIN_TOKEN" Target="JELLYFIN_TOKEN" Default="" Description="Jellyfin API token." Type="Variable" Display="advanced" Required="false" Mask="true"/>
 </Container>

@@ -1,9 +1,8 @@
-numpy
-stable-ts-whisperless
-fastapi
+fastapi>=0.100,<0.136
+starlette<1.0
 requests
-faster-whisper
 uvicorn
 python-multipart
 ffmpeg-python
 watchdog
+av
